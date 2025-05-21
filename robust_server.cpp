@@ -78,12 +78,11 @@ int main(void){
     }
     cout << "Listening on port: " << port << "...\n";
     
-    memset(fds, 0 , sizeof(fds));
+    memset(s->clients, 0 , sizeof(fds));
 
-    [0].fd = listen_sd;
-    fds[0].events = POLLIN;
+    s->clients[0].fd = listen_sd;
+    s->clients[0].events = POLLIN;
   
-    int timeout = (3 * 60 * 1000);
 
     do{
         
