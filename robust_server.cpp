@@ -23,6 +23,7 @@ using std::function;
 using std::unique_lock;
 using std::mutex;
 using std::condition_variable;
+using std::ThreadPool;
 using std::string;
 using std::cerr;
 using std::cout;
@@ -88,69 +89,42 @@ typedef struct Task_t{
     thread id;
 } Task_t;
 
-class ThreadPool {
-public:
-    ThreadPool(size_t num_threads = thread::hardware_concurrency(), Server_p s = NULL){ // Constructor
-        // Creating worker threads
-        for (size_t i = 0; i < num_threads; ++i) {
-            // Fills the vector of threads with their behaviour func
-            threads_.emplace_back([this] {
-                while (true) {
-                    // Defines standard thread behaviour func
-                    function<void()> task; {
-                        // Locking the queue
-                        unique_lock<mutex> lock(queue_mutex_);
-                        // Waiting until there is a task to execute
-                        cv_.wait(lock, [this] { return !tasks_.empty() || stop_; });
+typedef struct ThreadPool{
+    mutable mutex mutex;
+    condition_variable condition_variable;
+    vector<thread> threads;
+    bool shutdown_request;
+    queue<function<void()>> queue;
+    int busy_threads;
+} ThreadPool;
 
-                        // Exit the thread if queue empty
-                        if (stop_ && tasks_.empty()) { return; }
-
-                        // Get the next task from the queue
-                        task = move(tasks_.front());
-                        tasks_.pop();
-                    }
-
-                    task();
-                }
-            });
-        }
-    }
-
-    // Destructor to stop the thread pool
-    ~ThreadPool(){
-        { //! varför är de här curly braces här?
-            // Lock the queue to update the stop flag safely
-            unique_lock<mutex> lock(queue_mutex_);
-            stop_ = true;
-        }
-
-        // Notify all threads
-        cv_.notify_all();
-
-        // Joining all worker threads
-        for (auto& thread : threads_) {
-            thread.join();
-        }
-    }
-
-    // To add tasks to th queue
-    void enqueue(function<void()> task){
+class ThreadWorker{
+    public:
+        ThreadWorker(ThreadPool* pool) : thread_pool(pool)
         {
-            unique_lock<mutex> lock(queue_mutex_);
-            tasks_.emplace(move(task));
         }
-        cv_.notify_one();
-    }
 
-private:
-    vector<thread> threads_;
-    queue<function<void()> > tasks_;
-    mutex queue_mutex_;
-    condition_variable cv_;
-    bool stop_ = false;
-    Server_p s;
-};
+        void operator()(){
+            unique_lock<mutex> lock(thread_pool->mutex);
+            while(!thread_pool->shutdown_request || (thread_pool->shutdown_request && !thread_pool->queue.empty())){
+                thread_pool->busy_threads--;
+                thread_pool->condition_variable.wait(lock, [this] {
+                    return this->thread_pool->shutdown_request || !this->thread_pool->queue.empty();
+                });
+                thread_pool->busy_threads++;
+                if(!this->thread_pool->queue.empty()){
+                    auto func = thread_pool->queue.front();
+                    thread_pool->queue.pop();
+
+                    lock.unlock();
+                    func();
+                    lock.lock();
+                }
+            }
+        }
+    private:
+    ThreadPool* thread_pool;
+}
 
 void accept_client(){
     int new_client = -1;
