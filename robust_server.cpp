@@ -26,6 +26,9 @@ using std::condition_variable;
 using std::string;
 using std::cerr;
 using std::cout;
+
+using std::shared_ptr;
+using std::make_shared;
 using std::unique_ptr;
 using std::make_unique;
 
@@ -47,9 +50,47 @@ using std::make_unique;
 const int port = 8080;
 const char ip[] = "127.0.0.1";
 
+
+typedef struct Server_t{
+    int server_fd;                          // server file descriptor
+    int client_n;                           // another name is 'nfds'
+    char buffer[BUFFER_SIZE] = {0};         // message buffer
+    size_t buff_len;                        // buffer lenght
+    struct pollfd clients[200];
+    int_fast8_t flags;
+    
+    Server_t(void) :
+    server_fd(-1),
+    client_n(1),
+    flags(0),
+    buff_len(sizeof(buffer))                // constructor
+    {
+        memset(clients, 0 , sizeof(clients));
+    }
+
+    void send_msg(const char * txt, int flag){ // handels sending messages to client
+        memset(&buffer, sizeof(buffer), 0);
+        strcpy(buffer, txt);
+        // send(client_fd, &buffer, buff_len, flag);
+    }
+    
+    // Do more with this
+    int set_flag(){
+        return 0;
+    }
+}Server_t;
+
+typedef shared_ptr<Server_t> Server_p;
+
+typedef struct Task_t{
+    function<void()> task;
+    Server_p s;
+    thread id;
+} Task_t;
+
 class ThreadPool {
 public:
-    ThreadPool(size_t num_threads = thread::hardware_concurrency()){ // Constructor
+    ThreadPool(size_t num_threads = thread::hardware_concurrency(), Server_p s = NULL){ // Constructor
         // Creating worker threads
         for (size_t i = 0; i < num_threads; ++i) {
             // Fills the vector of threads with their behaviour func
@@ -96,64 +137,44 @@ public:
     // To add tasks to th queue
     void enqueue(function<void()> task){
         {
-            unique_lock<std::mutex> lock(queue_mutex_);
+            unique_lock<mutex> lock(queue_mutex_);
             tasks_.emplace(move(task));
         }
         cv_.notify_one();
     }
 
 private:
-    // Vector to store worker threads
     vector<thread> threads_;
-
-    // Queue of tasks
     queue<function<void()> > tasks_;
-
-    // Mutex to synchronize access to shared data
     mutex queue_mutex_;
-
-    // Condition variable to signal changes in the state of
-    // the tasks queue
     condition_variable cv_;
-
-    // Flag to indicate whether the thread pool should stop
-    // or not
     bool stop_ = false;
+    Server_p s;
 };
 
-typedef struct Server_t{
-    int server_fd;                          // server file descriptor
-    int client_n;                           // another name is 'nfds'
-    char buffer[BUFFER_SIZE] = {0};         // message buffer
-    size_t buff_len;                        // buffer lenght
-    struct pollfd clients[200];
-    int_fast8_t flags;
-
-    Server_t(void) :
-    server_fd(-1),
-    client_n(1),
-    flags(0),
-    buff_len(sizeof(buffer))                // constructor
-    {
-        memset(clients, 0 , sizeof(clients));
-    }
-
-    void send_msg(const char * txt, int flag){ // handels sending messages to client
-        memset(&buffer, sizeof(buffer), 0);
-        strcpy(buffer, txt);
-        // send(client_fd, &buffer, buff_len, flag);
-    }
-
-    // Do more with this
-    int set_flag(){
-        return 0;
-    }
-}Server_t;
-
-typedef unique_ptr<Server_t> Server_p;
+void accept_client(){
+    int new_client = -1;
+    printf(" Listening socket is readable\n");
+    do{
+        new_client = accept(s->server_fd, NULL, NULL);
+        if (new_client < 0)
+        {
+            if (errno != EWOULDBLOCK)
+            {
+                perror("  accept() failed");
+                s->flags |= END_SERVER;
+            }
+            break;
+        }
+        printf("  New incoming connection - %d\n", new_client);
+        s->clients[s->client_n].fd = new_client;
+        s->clients[s->client_n].events = POLLIN;
+        s->client_n++;
+    } while (new_client != -1);
+}
 
 int main(void){
-    Server_p s = make_unique<Server_t>();
+    Server_p s = make_shared<Server_t>();
     s->server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if(s->server_fd <= 0){
         cerr << "Failed to create server socket\n";
@@ -192,7 +213,9 @@ int main(void){
     s->clients[0].fd = s->server_fd;
     s->clients[0].events = POLLIN;
   
-    int rc = 0, new_client = -1;
+    int rc = 0;
+    auto tp = ThreadPool(2);
+    /*** Start of main loop ***/
     do{
         cout << "Wating on poll() ...\n";
         rc = poll(s->clients, s->client_n, TIMEOUT);
@@ -211,68 +234,17 @@ int main(void){
             }
 
             // Error check to make sure that revents is POLLIN
-            if(s->clients[i].revents != POLLIN) //! men varför?
-            {
+            if(s->clients[i].revents != POLLIN){ //! men varför är det fel om det är inte POLLIN?
                 printf("  Error! revents = %d\n", s->clients[i].revents);
                 s->flags |= END_SERVER;
                 break;
 
             }
-            if (s->clients[i].fd == s->server_fd)
-            {
-                /*******************************************************/
-                /* Listening descriptor is readable.                   */
-                /*******************************************************/
-                printf("  Listening socket is readable\n");
-
-                /*******************************************************/
-                /* Accept all incoming connections that are            */
-                /* queued up on the listening socket before we         */
-                /* loop back and call poll again.                      */
-                /*******************************************************/
-                do
-                {
-                /*****************************************************/
-                /* Accept each incoming connection. If               */
-                /* accept fails with EWOULDBLOCK, then we            */
-                /* have accepted all of them. Any other              */
-                /* failure on accept will cause us to end the        */
-                /* server.                                           */
-                /*****************************************************/
-                new_client = accept(s->server_fd, NULL, NULL);
-                if (new_client < 0)
-                {
-                    if (errno != EWOULDBLOCK)
-                    {
-                    perror("  accept() failed");
-                    s->flags |= END_SERVER;
-                    }
-                    break;
-                }
-
-                /*****************************************************/
-                /* Add the new incoming connection to the            */
-                /* pollfd structure                                  */
-                /*****************************************************/
-                printf("  New incoming connection - %d\n", new_client);
-                s->clients[s->client_n].fd = new_client;
-                s->clients[s->client_n].events = POLLIN;
-                s->client_n++;
-
-                /*****************************************************/
-                /* Loop back up and accept another incoming          */
-                /* connection                                        */
-                /*****************************************************/
-                } while (new_client != -1);
+            if (s->clients[i].fd == s->server_fd){
+                auto task = (function<void()>)accept_client;
+                tp.enqueue(task);
             }
-
-            /*********************************************************/
-            /* This is not the listening socket, therefore an        */
-            /* existing connection must be readable                  */
-            /*********************************************************/
-
-            else
-            {
+            else{
                 printf("  Descriptor %d is readable\n", s->clients[i].fd);
                 s->flags |= CLOSE_COMM;
                 cout << "before: " << (int)s->flags << "\n";
