@@ -71,7 +71,8 @@ int main(int argc, char *argv[]){
         if (argc >= 2)
         {
             c->send_msg(argv[1], 0);
-            c->read_msg();
+            // c->read_msg();
+            sleep(1);
         }
     }
 

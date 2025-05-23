@@ -18,23 +18,19 @@
 using std::vector;
 using std::queue;
 using std::thread;
-// using thread::hardware_concurrency;
 using std::function;
 using std::unique_lock;
 using std::mutex;
 using std::condition_variable;
-using std::ThreadPool;
 using std::string;
 using std::cerr;
 using std::cout;
 
 using std::shared_ptr;
 using std::make_shared;
-using std::unique_ptr;
-using std::make_unique;
 
 #define BUFFER_SIZE 1024
-#define TIMEOUT 1 * 60 * 1000               // Timeout for three minutes
+#define TIMEOUT 1000  * 1 * 60            // Timeout for three minutes
 
 
 #define END_SERVER      (1 << 0)            // bit to close the serever
@@ -59,10 +55,12 @@ typedef struct Server_t{
     size_t buff_len;                        // buffer lenght
     struct pollfd clients[200];
     int_fast8_t flags;
+    int curr_client;
     
     Server_t(void) :
     server_fd(-1),
     client_n(1),
+    curr_client(-1),
     flags(0),
     buff_len(sizeof(buffer))                // constructor
     {
@@ -84,49 +82,139 @@ typedef struct Server_t{
 typedef shared_ptr<Server_t> Server_p;
 
 typedef struct Task_t{
-    function<void()> task;
+    function<void(Server_p s)> func;
     Server_p s;
-    thread id;
+    int id;
 } Task_t;
 
-typedef struct ThreadPool{
-    mutable mutex mutex;
-    condition_variable condition_variable;
-    vector<thread> threads;
-    bool shutdown_request;
-    queue<function<void()>> queue;
-    int busy_threads;
-} ThreadPool;
+class ThreadPool {
+public:
+    // // Constructor to creates a thread pool with given
+    // number of threads
+    ThreadPool(size_t num_threads = thread::hardware_concurrency())
+    {
 
-class ThreadWorker{
-    public:
-        ThreadWorker(ThreadPool* pool) : thread_pool(pool)
-        {
-        }
+        // Creating worker threads
+        for (size_t i = 0; i < num_threads; ++i) {
+            threads_.emplace_back([this] { // Creates thread in Threads_ with [this] as the thread and a Lambda function (it's main loop)
+                while (true) {
+                    Task_t t;
+                    {
+                        // Locking the queue so that data
+                        // can be shared safely
+                        unique_lock<mutex> lock(queue_mutex_);
 
-        void operator()(){
-            unique_lock<mutex> lock(thread_pool->mutex);
-            while(!thread_pool->shutdown_request || (thread_pool->shutdown_request && !thread_pool->queue.empty())){
-                thread_pool->busy_threads--;
-                thread_pool->condition_variable.wait(lock, [this] {
-                    return this->thread_pool->shutdown_request || !this->thread_pool->queue.empty();
-                });
-                thread_pool->busy_threads++;
-                if(!this->thread_pool->queue.empty()){
-                    auto func = thread_pool->queue.front();
-                    thread_pool->queue.pop();
+                        // Waiting until there is a task to
+                        // execute or the pool is stopped
 
-                    lock.unlock();
-                    func();
-                    lock.lock();
+                        //? Lambda func which tells the wait if it should open the the mutex lock?
+                        cv_.wait(lock, [this] {
+                            return !tasks_.empty() || stop_;
+                        });
+
+                        // exit the thread in case the pool
+                        // is stopped and there are no tasks
+                        if (stop_ && tasks_.empty()) {
+                            return; //? this return where to?
+                        }
+
+                        // Get the next task from the queue
+                        t = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+
+                    t.func(t.s);
                 }
-            }
+            });
         }
-    private:
-    ThreadPool* thread_pool;
+    }
+
+    // Destructor to stop the thread pool
+    ~ThreadPool()
+    {
+        {
+            // Lock the queue to update the stop flag safely
+            unique_lock<mutex> lock(queue_mutex_);
+            stop_ = true;
+        }
+
+        // Notify all threads
+        cv_.notify_all();
+
+        // Joining all worker threads to ensure they have
+        // completed their tasks
+        for (auto& thread : threads_) {
+            thread.join();
+        }
+    }
+
+    // Enqueue task for execution by the thread pool
+    void enqueue(Task_t& task)
+    {
+        {
+            unique_lock<std::mutex> lock(queue_mutex_);
+            tasks_.emplace(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    // Vector to store worker threads
+    vector<thread> threads_;
+
+    // Queue of tasks
+    queue<Task_t> tasks_;
+
+    // Mutex to synchronize access to shared data
+    mutex queue_mutex_;
+
+    // Condition variable to signal changes in the state of
+    // the tasks queue
+    condition_variable cv_;
+
+    // Flag to indicate whether the thread pool should stop
+    // or not
+    bool stop_ = false;
+};
+
+void recive_client(Server_p s){
+    s->flags &= ~CLOSE_COMM;
+    int rc;
+    do{
+        memset(s->buffer, 0, s->buff_len);
+        rc = recv(s->clients[s->curr_client].fd, s->buffer, s->buff_len, 0);
+        if (rc < 0)
+        {
+            if (errno != EWOULDBLOCK){
+                perror("  recv() failed");
+                s->flags |= CLOSE_COMM;
+            }
+            break;
+        }
+        if (rc == 0){
+            printf("  Connection closed\n");
+            s->flags |= CLOSE_COMM;
+            break;
+        }
+        cout << s->curr_client << ": " << s->clients[s->curr_client].fd << " / buffer: " << s->buffer << '\n';
+
+    } while(true);
+
+    /*******************************************************/
+    /* If the close_conn flag was turned on, we need       */
+    /* to clean up this active connection. This            */
+    /* clean up process includes removing the              */
+    /* descriptor.                                         */
+    /*******************************************************/
+    if ((s->flags & CLOSE_COMM)){
+        cout << "removing client\n";
+        close(s->clients[s->curr_client].fd);
+        s->clients[s->curr_client].fd = -1;
+        s->flags |= COMP_ARR;
+    }
 }
 
-void accept_client(){
+void accept_client(Server_p s){
     int new_client = -1;
     printf(" Listening socket is readable\n");
     do{
@@ -188,19 +276,19 @@ int main(void){
     s->clients[0].events = POLLIN;
   
     int rc = 0;
-    auto tp = ThreadPool(2);
+    ThreadPool tp = ThreadPool(4);
     /*** Start of main loop ***/
     do{
-        cout << "Wating on poll() ...\n";
+        cout << "Wating on poll()...\n";
         rc = poll(s->clients, s->client_n, TIMEOUT);
         if(rc < 0){
             cerr << "Failed to use poll, closing the server\n";
             break; 
         }
-        else if(rc == 0){
-            cerr << "timeout has expired, closing the server\n";
-            break;
-        }
+        // else if(rc == 0){
+        //     cerr << "timeout has expired, closing the server\n";
+        //     break;
+        // }
 
         for(int i = 0; i < s->client_n; i++){
             if(s->clients[i].revents == 0){
@@ -215,76 +303,18 @@ int main(void){
 
             }
             if (s->clients[i].fd == s->server_fd){
-                auto task = (function<void()>)accept_client;
-                tp.enqueue(task);
+                Task_t t;
+                t.func = accept_client;
+                t.s = s;
+                tp.enqueue(t);
             }
             else{
-                printf("  Descriptor %d is readable\n", s->clients[i].fd);
-                s->flags |= CLOSE_COMM;
-                cout << "before: " << (int)s->flags << "\n";
-                s->flags &= ~CLOSE_COMM;
-                cout << "after: " << (int)s->flags << "\n";
-                sleep(1);
-                /*******************************************************/
-                /* Receive all incoming data on this socket            */
-                /* before we loop back and call poll again.            */
-                /*******************************************************/
-
-                // do
-                {
-                /*****************************************************/
-                /* Receive data on this connection until the         */
-                /* recv fails with EWOULDBLOCK. If any other         */
-                /* failure occurs, we will close the                 */
-                /* connection.                                       */
-                /*****************************************************/
-                rc = recv(s->clients[i].fd, s->buffer, s->buff_len, 0);
-                if (rc < 0)
-                {
-                    if (errno != EWOULDBLOCK){
-                        perror("  recv() failed");
-                        s->flags |= CLOSE_COMM;
-                    }
-                    break;
-                }
-
-                /*****************************************************/
-                /* Check to see if the connection has been           */
-                /* closed by the client                              */
-                /*****************************************************/
-                if (rc == 0){
-                    printf("  Connection closed\n");
-                    s->flags |= CLOSE_COMM;
-                    break;
-                }
-
-                /*****************************************************/
-                /* Data was received                                 */
-                /*****************************************************/
-                int len = rc;
-                // !printf("  %d bytes received\n", len);
-
-                /*****************************************************/
-                /* Echo the data back to the client                  */
-                /*****************************************************/
-                cout << i << ": " << s->clients[i].fd << " / buffer: " << s->buffer << '\n';
-
-                } //while(true);
-
-                /*******************************************************/
-                /* If the close_conn flag was turned on, we need       */
-                /* to clean up this active connection. This            */
-                /* clean up process includes removing the              */
-                /* descriptor.                                         */
-                /*******************************************************/
-                if ((s->flags & CLOSE_COMM)){
-                    cout << "removing client\n";
-                    close(s->clients[i].fd);
-                    s->clients[i].fd = -1;
-                    s->flags |= COMP_ARR;
-                }
-
-
+                s->curr_client = i;
+                printf("  Descriptor %d is readable\n", s->clients[s->curr_client].fd);
+                Task_t t;
+                t.func = recive_client;
+                t.s = s;
+                tp.enqueue(t);
             }  /* End of existing connection is readable             */
         } /* End of loop through pollable descriptors              */
 
