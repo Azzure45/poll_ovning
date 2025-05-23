@@ -82,7 +82,7 @@ typedef struct Server_t{
 typedef shared_ptr<Server_t> Server_p;
 
 typedef struct Task_t{
-    function<void(Server_p s)> func;
+    function<void(Server_p s, int)> func;
     Server_p s;
     int id;
 } Task_t;
@@ -98,8 +98,10 @@ public:
         for (size_t i = 0; i < num_threads; ++i) {
             threads_.emplace_back([this] { // Creates thread in Threads_ with [this] as the thread and a Lambda function (it's main loop)
                 while (true) {
+                    int current_fd;
                     Task_t t;
                     {
+
                         // Locking the queue so that data
                         // can be shared safely
                         unique_lock<mutex> lock(queue_mutex_);
@@ -107,7 +109,7 @@ public:
                         // Waiting until there is a task to
                         // execute or the pool is stopped
 
-                        //? Lambda func which tells the wait if it should open the the mutex lock?
+                        //? Lambda func which tells the wait if it should open the the mutex lock or not?
                         cv_.wait(lock, [this] {
                             return !tasks_.empty() || stop_;
                         });
@@ -115,15 +117,16 @@ public:
                         // exit the thread in case the pool
                         // is stopped and there are no tasks
                         if (stop_ && tasks_.empty()) {
-                            return; //? this return where to?
+                            return; //? this returns to where?
                         }
 
                         // Get the next task from the queue
                         t = std::move(tasks_.front());
                         tasks_.pop();
+                        current_fd = t.id;
                     }
 
-                    t.func(t.s);
+                    t.func(t.s, current_fd);
                 }
             });
         }
@@ -149,8 +152,9 @@ public:
     }
 
     // Enqueue task for execution by the thread pool
-    void enqueue(Task_t& task)
+    void enqueue(Task_t& task, int fd)
     {
+        task.id = fd;
         {
             unique_lock<std::mutex> lock(queue_mutex_);
             tasks_.emplace(std::move(task));
@@ -177,7 +181,8 @@ private:
     bool stop_ = false;
 };
 
-void recive_client(Server_p s){
+void recive_client(Server_p s, int fd){
+    cout << "Start of receive\n";
     s->flags &= ~CLOSE_COMM;
     int rc;
     do{
@@ -186,7 +191,7 @@ void recive_client(Server_p s){
         if (rc < 0)
         {
             if (errno != EWOULDBLOCK){
-                perror("  recv() failed");
+                perror("  recv() failed\n");
                 s->flags |= CLOSE_COMM;
             }
             break;
@@ -200,12 +205,6 @@ void recive_client(Server_p s){
 
     } while(true);
 
-    /*******************************************************/
-    /* If the close_conn flag was turned on, we need       */
-    /* to clean up this active connection. This            */
-    /* clean up process includes removing the              */
-    /* descriptor.                                         */
-    /*******************************************************/
     if ((s->flags & CLOSE_COMM)){
         cout << "removing client\n";
         close(s->clients[s->curr_client].fd);
@@ -214,16 +213,16 @@ void recive_client(Server_p s){
     }
 }
 
-void accept_client(Server_p s){
+void accept_client(Server_p s, int fd){
     int new_client = -1;
-    printf(" Listening socket is readable\n");
+    // printf(" Listening socket is readable\n");
     do{
         new_client = accept(s->server_fd, NULL, NULL);
         if (new_client < 0)
         {
             if (errno != EWOULDBLOCK)
             {
-                perror("  accept() failed");
+                perror("  accept() failed\n");
                 s->flags |= END_SERVER;
             }
             break;
@@ -276,10 +275,10 @@ int main(void){
     s->clients[0].events = POLLIN;
   
     int rc = 0;
-    ThreadPool tp = ThreadPool(4);
+    ThreadPool* tp = new ThreadPool(4);
     /*** Start of main loop ***/
     do{
-        cout << "Wating on poll()...\n";
+        // cout << "Wating on poll()...\n";
         rc = poll(s->clients, s->client_n, TIMEOUT);
         if(rc < 0){
             cerr << "Failed to use poll, closing the server\n";
@@ -299,6 +298,8 @@ int main(void){
             if(s->clients[i].revents != POLLIN){ //! men varför är det fel om det är inte POLLIN?
                 printf("  Error! revents = %d\n", s->clients[i].revents);
                 s->flags |= END_SERVER;
+                printf("flags: %d\n", s->flags);
+                delete tp;
                 break;
 
             }
@@ -306,15 +307,15 @@ int main(void){
                 Task_t t;
                 t.func = accept_client;
                 t.s = s;
-                tp.enqueue(t);
+                tp->enqueue(t, i);
             }
             else{
                 s->curr_client = i;
-                printf("  Descriptor %d is readable\n", s->clients[s->curr_client].fd);
+                // printf("  Descriptor %d is readable\n", s->clients[s->curr_client].fd);
                 Task_t t;
                 t.func = recive_client;
                 t.s = s;
-                tp.enqueue(t);
+                tp->enqueue(t, i);
             }  /* End of existing connection is readable             */
         } /* End of loop through pollable descriptors              */
 
@@ -327,6 +328,7 @@ int main(void){
             /***********************************************************/
 
             //! would be KINDA funny to use merge sort here
+            printf("Sorting flag: %d\n", (s->flags & COMP_ARR));
             if (s->flags & COMP_ARR){
                 s->flags &= ~COMP_ARR;
                 for (int i = 0; i < s->client_n; i++){
@@ -339,7 +341,7 @@ int main(void){
                     }
                 }
             }
-        
+        cout << "Checking if server should end\nState: " << (s->flags & END_SERVER) << "\n";
     }while (!(s->flags & END_SERVER)); /* End of serving running.    */
 
   /*************************************************************/

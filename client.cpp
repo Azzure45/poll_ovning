@@ -67,14 +67,14 @@ int main(int argc, char *argv[]){
     }
 
     cout << "Connected successfully\n";
-    while(true){
         if (argc >= 2)
         {
             c->send_msg(argv[1], 0);
             // c->read_msg();
-            sleep(1);
+            sleep(5);
+
+            c->send_msg(argv[1], 0);
         }
-    }
 
     close(c->client_fd);
 }
