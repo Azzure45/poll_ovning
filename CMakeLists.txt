@@ -15,4 +15,3 @@ add_executable(client client.cpp)
 
 include(CTest)
 enable_testing()
-
