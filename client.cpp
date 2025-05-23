@@ -29,14 +29,14 @@ typedef struct Client_t{
     }
 
     void send_msg(const char * txt, int flag){ // handels sending messages to server
-        memset(&buffer, sizeof(buffer), 0);
+        memset(&buffer, 0, sizeof(buffer));
         strcpy(buffer, txt);
         if(flag != MSG_OOB){ send(client_fd, &buffer, buff_len, flag); }
         else{send(client_fd, &buffer, 1, flag);}
     }
 
     void read_msg(void){
-        memset(&buffer, sizeof(buffer), 0);
+        memset(&buffer, 0, sizeof(buffer));
         read(client_fd, &buffer, buff_len);
         cout << buffer << "\n";
 
@@ -67,14 +67,15 @@ int main(int argc, char *argv[]){
     }
 
     cout << "Connected successfully\n";
+    // while(true){
         if (argc >= 2)
         {
             c->send_msg(argv[1], 0);
-            // c->read_msg();
+            c->read_msg();
             sleep(5);
 
-            c->send_msg(argv[1], 0);
+            // c->send_msg(argv[1], 0);
         }
-
+    // }
     close(c->client_fd);
 }

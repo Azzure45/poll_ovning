@@ -32,7 +32,9 @@ using std::shared_ptr;
 using std::make_shared;
 
 #define BUFFER_SIZE 1024
-#define TIMEOUT 1000  * 1 * 60            // Timeout for three minutes
+#define TIMEOUT 1000   * 60            // Timeout in 60 sec
+#define COUNT_TASKS 20
+
 
 
 #define END_SERVER      (1 << 0)            // bit to close the serever
@@ -50,15 +52,13 @@ const int port = 8080;
 const char ip[] = "127.0.0.1";
 
 typedef struct Task_t{
-    function<void(Task_t *)> func;
-    int cfd;
-
     Task_t(int client_fd, function<void(Task_t *)> job) : cfd(client_fd), func(job)
     {
     }
-} Task_t;
 
-#define COUNT_TASKS 20
+    function<void(Task_t *)> func;
+    int cfd;
+} Task_t;
 
 class ThreadPool {
 public:
@@ -145,8 +145,8 @@ void read_client(Task_t *t){
     pfd[0].fd = t->cfd;
     bool read_done = false;
     do{
-        rc = poll(pfd, 1, 1000*60);                             // the check for slow/non-resposive clients
-        if(rc < 0 || pfd[0].revents != POLLIN){
+        rc = poll(pfd, 1, TIMEOUT);                             // the check for slow/non-resposive clients
+        if(rc < 0 /*|| pfd[0].revents != POLLIN*/){
             close(pfd[0].fd);
             cerr << "Closing socket due to error while using poll()\n";
             break;
@@ -158,6 +158,8 @@ void read_client(Task_t *t){
         }
 
         rc = read(pfd[0].fd, buffer + nbuffer, sizeof(buffer));
+        cout << "RC: " << rc << "\n";
+        cout << "fd: " << pfd[0].fd << "\n";
         if(rc <= 0){
             close(pfd[0].fd);
             cerr << "Closing socket due to being unable to read data\n";
@@ -237,24 +239,21 @@ int main(void){
             cerr << "Failed to use poll, closing the server\n";
             break; 
         }
-        int new_client = -1;
+        int cfd = -1;
         // printf(" Listening socket is readable\n");
         do{
-            new_client = accept(spoll[0].fd, NULL, NULL);
-            if (new_client < 0)
+            cfd = accept(spoll[0].fd, NULL, NULL);
+            if (cfd < 0)
             {
-                if (errno != EWOULDBLOCK)
-                {
-                    cerr << "accept() failed\n";
-                }
+                if (errno != EWOULDBLOCK){ cerr << "accept() failed\n"; }
                 break;
             }
-            printf("  New incoming connection - %d\n", new_client);
-            if(tp->addTask(spoll[0].fd, read_client) < 0){
+            printf("New incoming connection - %d\n", cfd);
+            if(tp->addTask(cfd, read_client) < 0){
                 cerr << "Too many clients\n";
                 break;
             }
-        } while (new_client != -1);
+        } while (cfd != -1);
 
         close(spoll[0].fd);
         break;
