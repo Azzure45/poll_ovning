@@ -62,47 +62,47 @@ typedef struct Task_t{
 
 class ThreadPool {
 public:
-    // Constructor to creates a thread pool with given
-    // number of threads
-    ThreadPool(size_t num_threads = thread::hardware_concurrency())
-    {
-        for(int i=0; i<COUNT_TASKS; i++){
-            Task_t *t = new Task_t(-1, NULL);
-            free_tasks.push(t);
-        }
+// Constructor to creates a thread pool with given
+// number of threads
+ThreadPool(size_t num_threads = thread::hardware_concurrency())
+{
+    for(int i=0; i<COUNT_TASKS; i++){
+        Task_t *t = new Task_t(-1, NULL);
+        free_tasks.push(t);
+    }
 
-        // Creating worker threads
-        for (size_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back([this] { // Creates thread in Threads_ with [this] as the thread and a Lambda function (it's main loop)
-                Task_t *t = {};
-                while (true) {
-                    {
-                        // Locking the queue so that data
-                        // can be shared safely
-                        unique_lock<mutex> lock(queue_mutex);
+    // Creating worker threads
+    for (size_t i = 0; i < num_threads; ++i) {
+        threads.emplace_back([this] { // Creates thread in Threads_ with [this] as the thread and a Lambda function (it's main loop)
+            Task_t *t = {};
+            while (true) {
+                {
+                    // Locking the queue so that data
+                    // can be shared safely
+                    unique_lock<mutex> lock(queue_mutex);
 
-                        // Waiting until there is a task to
-                        // execute or the pool is stopped
+                    // Waiting until there is a task to
+                    // execute or the pool is stopped
 
-                        //? Lambda func which tells the wait if it should open the the mutex lock or not?
-                        cv.wait(lock, [this] {
-                            return !busy_tasks.empty();
-                        });
-                        if (busy_tasks.empty()) {
-                            return;
-                        }
-                        
-                        // Get the next task from the queue
-                        t = busy_tasks.front();
-                        free_tasks.emplace(t);
-                        busy_tasks.pop();
+                    //? Lambda func which tells the wait if it should open the the mutex lock or not?
+                    cv.wait(lock, [this] {
+                        return !busy_tasks.empty();
+                    });
+                    if (busy_tasks.empty()) {
+                        return;
                     }
                     
-                    t->func(t);
+                    // Get the next task from the queue
+                    t = busy_tasks.front();
+                    free_tasks.emplace(t);
+                    busy_tasks.pop();
                 }
-            });
-        }
+                
+                t->func(t);
+            }
+        });
     }
+}
     ~ThreadPool()
     {
         cv.notify_all();
@@ -164,7 +164,7 @@ void read_client(Task_t *t){
             break;
         }
 
-        nbuffer += rc; //amount of data recived
+        nbuffer += rc; //Amount of data recived
         if(nbuffer > BUFFER_SIZE){
             send(pfd[0].fd, "ERROR: MSG TO LONG\n", 20, 0);
             memset(buffer, 0, sizeof(buffer));
@@ -174,10 +174,15 @@ void read_client(Task_t *t){
 
     }while(!read_done);
 
-    cout << pfd[0].fd << " / buffer: " << buffer << '\n';
+    // cout << pfd[0].fd << " / buffer: " << buffer << '\n';
 
-    std::string tmp = "time: " + timelocal(NULL);
-    send(pfd[0].fd, &tmp, tmp.size(), 0);
+    if(!strcmp(buffer, "Time\n")){
+        std::string txt = "time: " + timelocal(NULL);
+        send(pfd[0].fd, &txt, txt.size(), 0);
+    }
+    else{
+        send(pfd[0].fd, "ERROR: NOT VAILD COMMAND\n", 26, 0);
+    }
     close(pfd[0].fd);
 }
 
