@@ -37,7 +37,6 @@ typedef struct Client_t{
 
     void read_msg(void){
         memset(&buffer, 0, sizeof(buffer));
-        read(client_fd, &buffer, buff_len);
         cout << buffer << "\n";
 
     }
@@ -70,10 +69,8 @@ int main(int argc, char *argv[]){
     // while(true){
         if (argc >= 2)
         {
-            c->send_msg(argv[1], 0);
+            c->send_msg("Time\n", 0);
             c->read_msg();
-            sleep(5);
-
             // c->send_msg(argv[1], 0);
         }
     // }

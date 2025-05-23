@@ -14,7 +14,8 @@
 #include <queue>
 #include <thread>
 #include <condition_variable>
-#include <time.h>
+#include <iomanip> 
+#include <ctime>
 #include <string>
 
 using std::vector;
@@ -140,7 +141,7 @@ void read_client(Task_t *t){
     char buffer[BUFFER_SIZE] = {0}; 
     size_t nbuffer = 0;
     int rc;
-    struct pollfd pfd[1];
+    struct pollfd pfd[1];                                       // Poll file descriptor
     pfd[0].events = POLLIN;
     pfd[0].fd = t->cfd;
     bool read_done = false;
@@ -158,29 +159,40 @@ void read_client(Task_t *t){
         }
 
         rc = read(pfd[0].fd, buffer + nbuffer, sizeof(buffer));
-        cout << "RC: " << rc << "\n";
-        cout << "fd: " << pfd[0].fd << "\n";
         if(rc <= 0){
             close(pfd[0].fd);
             cerr << "Closing socket due to being unable to read data\n";
             break;
         }
 
-        nbuffer += rc; //Amount of data recived
-        if(nbuffer > BUFFER_SIZE){
+        for(int i=0; i<rc; i++){
+            if(buffer[i] == '\n' || buffer[i] == (char)0){
+                nbuffer = i;
+                break;
+            }
+        }
+        if(buffer[nbuffer] == '\n'){
+            read_done = true;
+        }
+        else if(nbuffer >= BUFFER_SIZE){
             send(pfd[0].fd, "ERROR: MSG TO LONG\n", 20, 0);
             memset(buffer, 0, sizeof(buffer));
-            continue;
+            close(pfd[0].fd);
+            return;
         }
-        if(buffer[nbuffer] == '\n'){ read_done = true; }
 
     }while(!read_done);
-
-    // cout << pfd[0].fd << " / buffer: " << buffer << '\n';
-
     if(!strcmp(buffer, "Time\n")){
-        std::string txt = "time: " + timelocal(NULL);
-        send(pfd[0].fd, &txt, txt.size(), 0);
+        char output[128];
+        const char* prefix = "Time: ";
+
+        time_t now = std::time(nullptr);
+        char timeStr[16];
+
+        std::strftime(timeStr, sizeof(timeStr), "%Hh %Mmin %Ssec", std::localtime(&now));
+
+        std::snprintf(output, sizeof(output), "%s%s", prefix, timeStr);
+        send(pfd[0].fd, output, sizeof(output), 0);
     }
     else{
         send(pfd[0].fd, "ERROR: NOT VAILD COMMAND\n", 26, 0);
@@ -254,8 +266,7 @@ int main(void){
                 break;
             }
         } while (cfd != -1);
-
-        close(spoll[0].fd);
-        break;
+        sleep(5);
     }
+    close(spoll[0].fd);
 }
