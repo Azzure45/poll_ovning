@@ -14,6 +14,8 @@
 #include <queue>
 #include <thread>
 #include <condition_variable>
+#include <time.h>
+#include <string>
 
 using std::vector;
 using std::queue;
@@ -47,208 +49,154 @@ using std::make_shared;
 const int port = 8080;
 const char ip[] = "127.0.0.1";
 
-
-typedef struct Server_t{
-    int server_fd;                          // server file descriptor
-    int client_n;                           // another name is 'nfds'
-    char buffer[BUFFER_SIZE] = {0};         // message buffer
-    size_t buff_len;                        // buffer lenght
-    struct pollfd clients[200];
-    int_fast8_t flags;
-    int curr_client;
-    
-    Server_t(void) :
-    server_fd(-1),
-    client_n(1),
-    curr_client(-1),
-    flags(0),
-    buff_len(sizeof(buffer))                // constructor
-    {
-        memset(clients, 0 , sizeof(clients));
-    }
-
-    void send_msg(const char * txt, int flag){ // handels sending messages to client
-        memset(&buffer, sizeof(buffer), 0);
-        strcpy(buffer, txt);
-        // send(client_fd, &buffer, buff_len, flag);
-    }
-    
-    // Do more with this
-    int set_flag(){
-        return 0;
-    }
-}Server_t;
-
-typedef shared_ptr<Server_t> Server_p;
-
 typedef struct Task_t{
-    function<void(Server_p s, int)> func;
-    Server_p s;
-    int id;
+    function<void(Task_t *)> func;
+    int cfd;
+
+    Task_t(int client_fd, function<void(Task_t *)> job) : cfd(client_fd), func(job)
+    {
+    }
 } Task_t;
+
+#define COUNT_TASKS 20
 
 class ThreadPool {
 public:
-    // // Constructor to creates a thread pool with given
+    // Constructor to creates a thread pool with given
     // number of threads
     ThreadPool(size_t num_threads = thread::hardware_concurrency())
     {
+        for(int i=0; i<COUNT_TASKS; i++){
+            Task_t *t = new Task_t(-1, NULL);
+            free_tasks.push(t);
+        }
 
         // Creating worker threads
         for (size_t i = 0; i < num_threads; ++i) {
-            threads_.emplace_back([this] { // Creates thread in Threads_ with [this] as the thread and a Lambda function (it's main loop)
+            threads.emplace_back([this] { // Creates thread in Threads_ with [this] as the thread and a Lambda function (it's main loop)
+                Task_t *t = {};
                 while (true) {
-                    int current_fd;
-                    Task_t t;
                     {
-
                         // Locking the queue so that data
                         // can be shared safely
-                        unique_lock<mutex> lock(queue_mutex_);
+                        unique_lock<mutex> lock(queue_mutex);
 
                         // Waiting until there is a task to
                         // execute or the pool is stopped
 
                         //? Lambda func which tells the wait if it should open the the mutex lock or not?
-                        cv_.wait(lock, [this] {
-                            return !tasks_.empty() || stop_;
+                        cv.wait(lock, [this] {
+                            return !busy_tasks.empty();
                         });
-
-                        // exit the thread in case the pool
-                        // is stopped and there are no tasks
-                        if (stop_ && tasks_.empty()) {
-                            return; //? this returns to where?
+                        if (busy_tasks.empty()) {
+                            return;
                         }
-
+                        
                         // Get the next task from the queue
-                        t = std::move(tasks_.front());
-                        tasks_.pop();
-                        current_fd = t.id;
+                        t = busy_tasks.front();
+                        free_tasks.emplace(t);
+                        busy_tasks.pop();
                     }
-
-                    t.func(t.s, current_fd);
+                    
+                    t->func(t);
                 }
             });
         }
     }
-
-    // Destructor to stop the thread pool
     ~ThreadPool()
     {
-        {
-            // Lock the queue to update the stop flag safely
-            unique_lock<mutex> lock(queue_mutex_);
-            stop_ = true;
-        }
-
-        // Notify all threads
-        cv_.notify_all();
-
-        // Joining all worker threads to ensure they have
-        // completed their tasks
-        for (auto& thread : threads_) {
+        cv.notify_all();
+        for (auto& thread : threads) {
             thread.join();
         }
     }
 
-    // Enqueue task for execution by the thread pool
-    void enqueue(Task_t& task, int fd)
-    {
-        task.id = fd;
-        {
-            unique_lock<std::mutex> lock(queue_mutex_);
-            tasks_.emplace(std::move(task));
+    int addTask(int cfd, function<void(Task_t *)> func){
+        if(free_tasks.empty()){
+            return -1;
         }
-        cv_.notify_one();
+        auto t = free_tasks.front();
+        t->cfd = cfd;
+        t->func = func;
+        // mutex lock
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            busy_tasks.emplace(t);
+        }
+        free_tasks.pop();
+        cv.notify_one();
+        return 1;
     }
 
 private:
-    // Vector to store worker threads
-    vector<thread> threads_;
-
-    // Queue of tasks
-    queue<Task_t> tasks_;
-
-    // Mutex to synchronize access to shared data
-    mutex queue_mutex_;
-
-    // Condition variable to signal changes in the state of
-    // the tasks queue
-    condition_variable cv_;
-
-    // Flag to indicate whether the thread pool should stop
-    // or not
-    bool stop_ = false;
+    vector<thread> threads;
+    queue<Task_t*> busy_tasks = {};
+    queue<Task_t*> free_tasks;
+    mutex queue_mutex;
+    condition_variable cv;
 };
 
-void recive_client(Server_p s, int fd){
-    cout << "Start of receive\n";
-    s->flags &= ~CLOSE_COMM;
+void read_client(Task_t *t){
+    char buffer[BUFFER_SIZE] = {0}; 
+    size_t nbuffer = 0;
     int rc;
+    struct pollfd pfd[1];
+    pfd[0].events = POLLIN;
+    pfd[0].fd = t->cfd;
+    bool read_done = false;
     do{
-        memset(s->buffer, 0, s->buff_len);
-        rc = recv(s->clients[s->curr_client].fd, s->buffer, s->buff_len, 0);
-        if (rc < 0)
-        {
-            if (errno != EWOULDBLOCK){
-                perror("  recv() failed\n");
-                s->flags |= CLOSE_COMM;
-            }
+        rc = poll(pfd, 1, 1000*60);                             // the check for slow/non-resposive clients
+        if(rc < 0 || pfd[0].revents != POLLIN){
+            close(pfd[0].fd);
+            cerr << "Closing socket due to error while using poll()\n";
             break;
         }
-        if (rc == 0){
-            printf("  Connection closed\n");
-            s->flags |= CLOSE_COMM;
+        else if(rc == 0){
+            close(pfd[0].fd);
+            cerr << "Closing socket due to it being non-resposive\n";
             break;
         }
-        cout << s->curr_client << ": " << s->clients[s->curr_client].fd << " / buffer: " << s->buffer << '\n';
 
-    } while(true);
+        rc = read(pfd[0].fd, buffer + nbuffer, sizeof(buffer));
+        if(rc <= 0){
+            close(pfd[0].fd);
+            cerr << "Closing socket due to being unable to read data\n";
+            break;
+        }
 
-    if ((s->flags & CLOSE_COMM)){
-        cout << "removing client\n";
-        close(s->clients[s->curr_client].fd);
-        s->clients[s->curr_client].fd = -1;
-        s->flags |= COMP_ARR;
-    }
+        nbuffer += rc; //amount of data recived
+        if(nbuffer > BUFFER_SIZE){
+            send(pfd[0].fd, "ERROR: MSG TO LONG\n", 20, 0);
+            memset(buffer, 0, sizeof(buffer));
+            continue;
+        }
+        if(buffer[nbuffer] == '\n'){ read_done = true; }
+
+    }while(!read_done);
+
+    cout << pfd[0].fd << " / buffer: " << buffer << '\n';
+
+    std::string tmp = "time: " + timelocal(NULL);
+    send(pfd[0].fd, &tmp, tmp.size(), 0);
+    close(pfd[0].fd);
 }
 
-void accept_client(Server_p s, int fd){
-    int new_client = -1;
-    // printf(" Listening socket is readable\n");
-    do{
-        new_client = accept(s->server_fd, NULL, NULL);
-        if (new_client < 0)
-        {
-            if (errno != EWOULDBLOCK)
-            {
-                perror("  accept() failed\n");
-                s->flags |= END_SERVER;
-            }
-            break;
-        }
-        printf("  New incoming connection - %d\n", new_client);
-        s->clients[s->client_n].fd = new_client;
-        s->clients[s->client_n].events = POLLIN;
-        s->client_n++;
-    } while (new_client != -1);
-}
+
 
 int main(void){
-    Server_p s = make_shared<Server_t>();
-    s->server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(s->server_fd <= 0){
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(sfd <= 0){
         cerr << "Failed to create server socket\n";
         exit(1);
     }
     
     int opt = 1;
-    if(setsockopt(s->server_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0){
+    if(setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0){
         cerr << "Failed to use setsockopt\n";
         exit(2);
     }
 
-    if (ioctl(s->server_fd, FIONBIO, (char *)&opt) < 0)
+    if (ioctl(sfd, FIONBIO, (char *)&opt) < 0)
     {
         cerr << "Failed to use ioctl() to make socket non-blocking\n";
         exit(3);
@@ -260,311 +208,50 @@ int main(void){
     s_addr.sin_port=htons(port);
     inet_pton(AF_INET, ip, &s_addr.sin_addr);
 
-    if(bind(s->server_fd, (struct sockaddr *)&s_addr, sizeof(s_addr)) < 0){
+    if(bind(sfd, (struct sockaddr *)&s_addr, sizeof(s_addr)) < 0){
         cerr << "Failed to bind socket\n";
         exit(4);
     }
 
-    if(listen(s->server_fd, 1) < 0){
+    if(listen(sfd, 10) < 0){
         cerr << "Failed to listen\n";
         exit(5);
     }
     cout << "Listening on port: " << port << "...\n";
 
-    s->clients[0].fd = s->server_fd;
-    s->clients[0].events = POLLIN;
-  
+    struct pollfd spoll[1];
+    spoll[0].fd = sfd;
+    spoll[0].events = POLLIN;
     int rc = 0;
-    ThreadPool* tp = new ThreadPool(4);
+    auto tp = new ThreadPool(4);
     /*** Start of main loop ***/
-    do{
+    while(true){
         // cout << "Wating on poll()...\n";
-        rc = poll(s->clients, s->client_n, TIMEOUT);
+        rc = poll(spoll, 1, -1);
         if(rc < 0){
             cerr << "Failed to use poll, closing the server\n";
             break; 
         }
-        // else if(rc == 0){
-        //     cerr << "timeout has expired, closing the server\n";
-        //     break;
-        // }
-
-        for(int i = 0; i < s->client_n; i++){
-            if(s->clients[i].revents == 0){
-                continue;
-            }
-
-            // Error check to make sure that revents is POLLIN
-            if(s->clients[i].revents != POLLIN){ //! men varför är det fel om det är inte POLLIN?
-                printf("  Error! revents = %d\n", s->clients[i].revents);
-                s->flags |= END_SERVER;
-                printf("flags: %d\n", s->flags);
-                delete tp;
-                break;
-
-            }
-            if (s->clients[i].fd == s->server_fd){
-                Task_t t;
-                t.func = accept_client;
-                t.s = s;
-                tp->enqueue(t, i);
-            }
-            else{
-                s->curr_client = i;
-                // printf("  Descriptor %d is readable\n", s->clients[s->curr_client].fd);
-                Task_t t;
-                t.func = recive_client;
-                t.s = s;
-                tp->enqueue(t, i);
-            }  /* End of existing connection is readable             */
-        } /* End of loop through pollable descriptors              */
-
-            /***********************************************************/
-            /* If the compress_array flag was turned on, we need       */
-            /* to squeeze together the array and decrement the number  */
-            /* of file descriptors. We do not need to move back the    */
-            /* events and revents fields because the events will always*/
-            /* be POLLIN in this case, and revents is output.          */
-            /***********************************************************/
-
-            //! would be KINDA funny to use merge sort here
-            printf("Sorting flag: %d\n", (s->flags & COMP_ARR));
-            if (s->flags & COMP_ARR){
-                s->flags &= ~COMP_ARR;
-                for (int i = 0; i < s->client_n; i++){
-                    if (s->clients[i].fd == -1){
-                        for(int j = i; j < s->client_n-1; j++){
-                            s->clients[j].fd = s->clients[j+1].fd;
-                        }
-                    i--;
-                    s->client_n--;
-                    }
+        int new_client = -1;
+        // printf(" Listening socket is readable\n");
+        do{
+            new_client = accept(spoll[0].fd, NULL, NULL);
+            if (new_client < 0)
+            {
+                if (errno != EWOULDBLOCK)
+                {
+                    cerr << "accept() failed\n";
                 }
+                break;
             }
-        cout << "Checking if server should end\nState: " << (s->flags & END_SERVER) << "\n";
-    }while (!(s->flags & END_SERVER)); /* End of serving running.    */
+            printf("  New incoming connection - %d\n", new_client);
+            if(tp->addTask(spoll[0].fd, read_client) < 0){
+                cerr << "Too many clients\n";
+                break;
+            }
+        } while (new_client != -1);
 
-  /*************************************************************/
-  /* Clean up all of the sockets that are open                 */
-  /*************************************************************/
-  for (int i = 0; i < s->client_n; i++)
-  {
-    if(s->clients[i].fd >= 0){ close(s->clients[i].fd); }
-  }
+        close(spoll[0].fd);
+        break;
+    }
 }
-
-// do
-//   {
-//     /***********************************************************/
-//     /* Call poll() and wait 3 minutes for it to complete.      */
-//     /***********************************************************/
-//     printf("Waiting on poll()...\n");
-//     rc = poll(fds, nfds, timeout);
-
-//     /***********************************************************/
-//     /* Check to see if the poll call failed.                   */
-//     /***********************************************************/
-//     if (rc < 0)
-//     {
-//       perror("  poll() failed");
-//       break;
-//     }
-
-//     /***********************************************************/
-//     /* Check to see if the 3 minute time out expired.          */
-//     /***********************************************************/
-//     if (rc == 0)
-//     {
-//       printf("  poll() timed out.  End program.\n");
-//       break;
-//     }
-
-
-//     /***********************************************************/
-//     /* One or more descriptors are readable.  Need to          */
-//     /* determine which ones they are.                          */
-//     /***********************************************************/
-//     current_size = nfds;
-//     for (i = 0; i < current_size; i++)
-//     {
-//       /*********************************************************/
-//       /* Loop through to find the descriptors that returned    */
-//       /* POLLIN and determine whether it's the listening       */
-//       /* or the active connection.                             */
-//       /*********************************************************/
-//       if(fds[i].revents == 0)
-//         continue;
-
-//       /*********************************************************/
-//       /* If revents is not POLLIN, it's an unexpected result,  */
-//       /* log and end the server.                               */
-//       /*********************************************************/
-//       if(fds[i].revents != POLLIN)
-//       {
-//         printf("  Error! revents = %d\n", fds[i].revents);
-//         end_server = TRUE;
-//         break;
-
-//       }
-//       if (fds[i].fd == listen_sd)
-//       {
-//         /*******************************************************/
-//         /* Listening descriptor is readable.                   */
-//         /*******************************************************/
-//         printf("  Listening socket is readable\n");
-
-//         /*******************************************************/
-//         /* Accept all incoming connections that are            */
-//         /* queued up on the listening socket before we         */
-//         /* loop back and call poll again.                      */
-//         /*******************************************************/
-//         do
-//         {
-//           /*****************************************************/
-//           /* Accept each incoming connection. If               */
-//           /* accept fails with EWOULDBLOCK, then we            */
-//           /* have accepted all of them. Any other              */
-//           /* failure on accept will cause us to end the        */
-//           /* server.                                           */
-//           /*****************************************************/
-//           new_sd = accept(listen_sd, NULL, NULL);
-//           if (new_sd < 0)
-//           {
-//             if (errno != EWOULDBLOCK)
-//             {
-//               perror("  accept() failed");
-//               end_server = TRUE;
-//             }
-//             break;
-//           }
-
-//           /*****************************************************/
-//           /* Add the new incoming connection to the            */
-//           /* pollfd structure                                  */
-//           /*****************************************************/
-//           printf("  New incoming connection - %d\n", new_sd);
-//           fds[nfds].fd = new_sd;
-//           fds[nfds].events = POLLIN;
-//           nfds++;
-
-//           /*****************************************************/
-//           /* Loop back up and accept another incoming          */
-//           /* connection                                        */
-//           /*****************************************************/
-//         } while (new_sd != -1);
-//       }
-
-//       /*********************************************************/
-//       /* This is not the listening socket, therefore an        */
-//       /* existing connection must be readable                  */
-//       /*********************************************************/
-
-//       else
-//       {
-//         printf("  Descriptor %d is readable\n", fds[i].fd);
-//         close_conn = FALSE;
-//         /*******************************************************/
-//         /* Receive all incoming data on this socket            */
-//         /* before we loop back and call poll again.            */
-//         /*******************************************************/
-
-//         do
-//         {
-//           /*****************************************************/
-//           /* Receive data on this connection until the         */
-//           /* recv fails with EWOULDBLOCK. If any other         */
-//           /* failure occurs, we will close the                 */
-//           /* connection.                                       */
-//           /*****************************************************/
-//           rc = recv(fds[i].fd, buffer, sizeof(buffer), 0);
-//           if (rc < 0)
-//           {
-//             if (errno != EWOULDBLOCK)
-//             {
-//               perror("  recv() failed");
-//               close_conn = TRUE;
-//             }
-//             break;
-//           }
-
-//           /*****************************************************/
-//           /* Check to see if the connection has been           */
-//           /* closed by the client                              */
-//           /*****************************************************/
-//           if (rc == 0)
-//           {
-//             printf("  Connection closed\n");
-//             close_conn = TRUE;
-//             break;
-//           }
-
-//           /*****************************************************/
-//           /* Data was received                                 */
-//           /*****************************************************/
-//           len = rc;
-//           printf("  %d bytes received\n", len);
-
-//           /*****************************************************/
-//           /* Echo the data back to the client                  */
-//           /*****************************************************/
-//           rc = send(fds[i].fd, buffer, len, 0);
-//           if (rc < 0)
-//           {
-//             perror("  send() failed");
-//             close_conn = TRUE;
-//             break;
-//           }
-
-//         } while(TRUE);
-
-//         /*******************************************************/
-//         /* If the close_conn flag was turned on, we need       */
-//         /* to clean up this active connection. This            */
-//         /* clean up process includes removing the              */
-//         /* descriptor.                                         */
-//         /*******************************************************/
-//         if (close_conn)
-//         {
-//           close(fds[i].fd);
-//           fds[i].fd = -1;
-//           compress_array = TRUE;
-//         }
-
-
-//       }  /* End of existing connection is readable             */
-//     } /* End of loop through pollable descriptors              */
-
-//     /***********************************************************/
-//     /* If the compress_array flag was turned on, we need       */
-//     /* to squeeze together the array and decrement the number  */
-//     /* of file descriptors. We do not need to move back the    */
-//     /* events and revents fields because the events will always*/
-//     /* be POLLIN in this case, and revents is output.          */
-//     /***********************************************************/
-//     if (compress_array)
-//     {
-//       compress_array = FALSE;
-//       for (i = 0; i < nfds; i++)
-//       {
-//         if (fds[i].fd == -1)
-//         {
-//           for(j = i; j < nfds-1; j++)
-//           {
-//             fds[j].fd = fds[j+1].fd;
-//           }
-//           i--;
-//           nfds--;
-//         }
-//       }
-//     }
-
-//   } while (end_server == FALSE); /* End of serving running.    */
-
-//   /*************************************************************/
-//   /* Clean up all of the sockets that are open                 */
-//   /*************************************************************/
-//   for (i = 0; i < nfds; i++)
-//   {
-//     if(fds[i].fd >= 0)
-//       close(fds[i].fd);
-//   }
